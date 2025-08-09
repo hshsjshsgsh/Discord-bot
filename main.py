@@ -1,4 +1,4 @@
-import os
+qimport os
 from aiohttp import web
 
 async def handle(request):
@@ -714,4 +714,11 @@ async def cancel(ctx):
     tournament.__init__()
     await ctx.send("❌ Tournament cancelled.", delete_after=5)
 
-bot.run(TOKEN)
+
+import asyncio
+
+async def main():
+    await run_webserver()
+    await bot.start(os.getenv("TOKEN"))
+
+asyncio.run(main())
