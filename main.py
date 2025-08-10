@@ -1,4 +1,5 @@
-
+from keep_alive import keep_alive
+keep_alive()
 import discord
 from discord.ext import commands
 import os
@@ -699,6 +700,7 @@ async def cancel(ctx):
         
     tournament.__init__()
     await ctx.send("❌ Tournament cancelled.", delete_after=5)
-
+bot.run(os.getenv("TOKEN"))
+        
 bot.run(TOKEN)
 
