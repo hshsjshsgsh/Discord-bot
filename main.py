@@ -700,7 +700,32 @@ async def cancel(ctx):
         
     tournament.__init__()
     await ctx.send("❌ Tournament cancelled.", delete_after=5)
-bot.run(os.getenv("TOKEN"))
-        
-bot.run(TOKEN)
+from aiohttp import web
+import asyncio
+import os
+
+async def handle(request):
+    return web.Response(text="Bot is running!")
+
+async def run_webserver():
+    app = web.Application()
+    app.router.add_get("/", handle)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    port = int(os.environ.get("PORT", 8080))
+    site = web.TCPSite(runner, "0.0.0.0", port)
+    await site.start()
+
+async def main():
+    import discord
+    from discord.ext import commands
+    bot = commands.Bot(command_prefix="!")
+    
+    # !create,!code,!winner,!cancel,!ban,!warn,!mute,!lock,!unlock
+
+    await run_webserver()
+    await bot.start(os.getenv("TOKEN"))
+
+asyncio.run(main())
+
 
