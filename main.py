@@ -672,7 +672,7 @@ async def winner(ctx, member: discord.Member):
         
     current_round = tournament.rounds[-1]
     winner_name = member.display_name
-        except:
+     except:
             pass
     
     await ctx.send(f"🤖 Added {number} fake player{'s' if number > 1 else ''}. Total players: {len(tournament.players)}/{tournament.max_players}", delete_after=5)
