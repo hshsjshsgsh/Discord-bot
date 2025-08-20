@@ -1,0 +1,521 @@
+import discord
+from discord.ext import commands
+import os
+import random
+import asyncio
+import json
+from datetime import datetime, timedelta
+from keep_alive import keep_alive
+
+TOKEN = os.getenv("TOKEN")
+
+intents = discord.Intents.default()
+intents.message_content = True
+intents.members = True
+
+bot = commands.Bot(command_prefix="!", intents=intents)
+
+class Tournament:
+    def __init__(self):
+        self.players = []
+        self.teams = {}  # {user_id: team_partner_id}
+        self.team_invites = {}  # {user_id: inviter_id}
+        self.max_players = 0
+        self.active = False
+        self.channel = None
+        self.target_channel = None
+        self.message = None
+        self.rounds = []
+        self.results = []
+        self.eliminated = []  # Track eliminated players for placement
+        self.fake_count = 1
+        self.map = "BlockDash"
+        self.abilities = "Punch, Spatula, Kick"
+        self.mode = "2v2"
+        self.prize = "Default"
+        self.title = "Tournament"
+
+tournament = Tournament()
+
+# Store user data
+user_data = {}
+tickets = {}
+warnings = {}
+user_levels = {}
+tp_data = {}  # Tournament Points data
+bracket_roles = {}  # {user_id: [emoji1, emoji2, emoji3]}
+host_registrations = {'active': False, 'max_hosters': 0, 'hosters': [], 'channel': None, 'message': None}
+leveling_settings = {'enabled': False, 'channel': None}
+welcomer_settings = {'enabled': False, 'channel': None}
+
+# TP Ranks
+TP_RANKS = {
+    'Wood': (0, 300),
+    'Bronze': (301, 600),
+    'Silver': (601, 900),
+    'Gold': (901, 1200),
+    'Platinum': (1201, 1500),
+    'Master': (1501, 1800),
+    'Champion': (1801, float('inf'))
+}
+
+def get_rank_from_tp(tp):
+    for rank, (min_tp, max_tp) in TP_RANKS.items():
+        if min_tp <= tp <= max_tp:
+            return rank
+    return 'Wood'
+
+def get_player_display_name(player):
+    """Get player display name with bracket roles (emojis) if set"""
+    if isinstance(player, FakePlayer):
+        return player.display_name
+    
+    if hasattr(player, 'nick') and player.nick:
+        base_name = player.nick
+    elif hasattr(player, 'display_name'):
+        base_name = player.display_name
+    else:
+        base_name = str(player)
+    
+    # Add bracket role emojis if user has them (after name, not before)
+    if hasattr(player, 'id') and str(player.id) in bracket_roles:
+        emojis = ''.join(bracket_roles[str(player.id)])
+        return f"{base_name} {emojis}"
+    
+    return base_name
+
+# Load data
+def load_data():
+    global user_data, user_levels, leveling_settings, welcomer_settings, tp_data, bracket_roles
+    try:
+        with open('user_data.json', 'r') as f:
+            data = json.load(f)
+            user_data = data.get('user_data', {})
+            user_levels = data.get('user_levels', {})
+            tp_data = data.get('tp_data', {})
+            bracket_roles = data.get('bracket_roles', {})
+            leveling_settings = data.get('leveling_settings', {'enabled': False, 'channel': None})
+            welcomer_settings = data.get('welcomer_settings', {'enabled': False, 'channel': None})
+    except FileNotFoundError:
+        pass
+
+def save_data():
+    data = {
+        'user_data': user_data,
+        'user_levels': user_levels,
+        'tp_data': tp_data,
+        'bracket_roles': bracket_roles,
+        'leveling_settings': leveling_settings,
+        'welcomer_settings': welcomer_settings
+    }
+    with open('user_data.json', 'w') as f:
+        json.dump(data, f)
+
+def add_xp(user_id, xp=1):
+    if str(user_id) not in user_levels:
+        user_levels[str(user_id)] = {'xp': 0, 'level': 1}
+
+    user_levels[str(user_id)]['xp'] += xp
+
+    # Calculate level (100 XP per level)
+    new_level = (user_levels[str(user_id)]['xp'] // 100) + 1
+    old_level = user_levels[str(user_id)]['level']
+
+    if new_level > old_level:
+        user_levels[str(user_id)]['level'] = new_level
+        return True, new_level
+
+    user_levels[str(user_id)]['level'] = new_level
+    return False, new_level
+
+def add_tp(user_id, tp):
+    if str(user_id) not in tp_data:
+        tp_data[str(user_id)] = 0
+    tp_data[str(user_id)] += tp
+    save_data()
+
+@bot.event
+async def on_ready():
+    print(f"✅ Bot is online as {bot.user}")
+    load_data()
+    
+    # Add persistent views for buttons to work after restart
+    bot.add_view(TournamentView())
+    bot.add_view(TicketView())
+    bot.add_view(AccountView())
+    bot.add_view(TournamentConfigView(None))
+    bot.add_view(HosterRegistrationView())
+    
+    print("🔧 Bot is ready and all systems operational!")
+
+@bot.event
+async def on_member_join(member):
+    if welcomer_settings['enabled'] and welcomer_settings['channel']:
+        channel = bot.get_channel(welcomer_settings['channel'])
+        if channel:
+            embed = discord.Embed(
+                title="🎉 Welcome!",
+                description=f"Welcome {member.mention} to **{member.guild.name}**!\n\nWe're happy to have you here! Make sure to read the rules and have fun!",
+                color=0x00ff00
+            )
+            embed.set_thumbnail(url=member.display_avatar.url)
+            embed.set_footer(text=f"Member #{len(member.guild.members)}")
+            await channel.send(embed=embed)
+
+@bot.event
+async def on_message(message):
+    if message.author.bot:
+        return
+
+    # Add XP for messages if leveling is enabled
+    if leveling_settings['enabled'] and leveling_settings['channel']:
+        leveled_up, level = add_xp(message.author.id)
+        if leveled_up:
+            channel = bot.get_channel(leveling_settings['channel'])
+            if channel:
+                embed = discord.Embed(
+                    title="🎉 Level Up!",
+                    description=f"{message.author.mention} reached **Level {level}**!",
+                    color=0xf1c40f
+                )
+                await channel.send(embed=embed)
+        save_data()
+
+    await bot.process_commands(message)
+
+class TeamInviteView(discord.ui.View):
+    def __init__(self, inviter_id, invited_id):
+        super().__init__(timeout=300)
+        self.inviter_id = inviter_id
+        self.invited_id = invited_id
+
+    @discord.ui.button(label="✅ Accept", style=discord.ButtonStyle.green)
+    async def accept_invite(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user.id != self.invited_id:
+            return await interaction.response.send_message("❌ This invite is not for you!", ephemeral=True)
+
+        # Create team
+        tournament.teams[self.inviter_id] = self.invited_id
+        tournament.teams[self.invited_id] = self.inviter_id
+
+        # Remove invite
+        if self.invited_id in tournament.team_invites:
+            del tournament.team_invites[self.invited_id]
+
+        embed = discord.Embed(
+            title="🤝 Team Formed!",
+            description=f"<@{self.inviter_id}> and <@{self.invited_id}> are now teammates!",
+            color=0x00ff00
+        )
+        await interaction.response.edit_message(embed=embed, view=None)
+
+    @discord.ui.button(label="❌ Reject", style=discord.ButtonStyle.red)
+    async def reject_invite(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user.id != self.invited_id:
+            return await interaction.response.send_message("❌ This invite is not for you!", ephemeral=True)
+
+        # Remove invite
+        if self.invited_id in tournament.team_invites:
+            del tournament.team_invites[self.invited_id]
+
+        embed = discord.Embed(
+            title="❌ Invite Rejected",
+            description=f"<@{self.invited_id}> rejected the team invitation.",
+            color=0xff0000
+        )
+        await interaction.response.edit_message(embed=embed, view=None)
+
+class TournamentConfigModal(discord.ui.Modal, title="Tournament Configuration"):
+    def __init__(self, target_channel):
+        super().__init__()
+        self.target_channel = target_channel
+
+    title_field = discord.ui.TextInput(
+        label="🏆 Tournament Title",
+        placeholder="Enter tournament title...",
+        default="Stumble Guys Tournament",
+        max_length=100
+    )
+
+    map_field = discord.ui.TextInput(
+        label="🗺️ Map",
+        placeholder="Enter map name...",
+        default="BlockDash",
+        max_length=50
+    )
+
+    abilities_field = discord.ui.TextInput(
+        label="💥 Abilities",
+        placeholder="Enter abilities...",
+        default="Punch, Spatula, Kick",
+        max_length=100
+    )
+
+    mode_and_players_field = discord.ui.TextInput(
+        label="🎮 Mode & Max Players",
+        placeholder="2v2 8 (format: mode maxplayers)",
+        default="2v2 8",
+        max_length=20
+    )
+
+    prize_field = discord.ui.TextInput(
+        label="💶 Prize",
+        placeholder="Enter prize...",
+        default="Default",
+        max_length=50
+    )
+
+    async def on_submit(self, interaction: discord.Interaction):
+        try:
+            # Validate target channel
+            if not self.target_channel:
+                await interaction.response.send_message("❌ Invalid target channel. Please try again.", ephemeral=True)
+                return
+            
+            # Parse mode and max players
+            mode_players_parts = self.mode_and_players_field.value.strip().split()
+            if len(mode_players_parts) != 2:
+                await interaction.response.send_message("❌ Format should be: mode maxplayers (e.g., '2v2 8')", ephemeral=True)
+                return
+                
+            mode = mode_players_parts[0]
+            max_players = int(mode_players_parts[1])
+            
+            if max_players not in [4, 8, 16]:
+                await interaction.response.send_message("❌ Max players must be 4, 8, or 16!", ephemeral=True)
+                return
+        except ValueError:
+            await interaction.response.send_message("❌ Invalid format! Use: mode maxplayers (e.g., '2v2 8')", ephemeral=True)
+            return
+        except Exception as e:
+            print(f"Error in tournament config modal: {e}")
+            await interaction.response.send_message("❌ An error occurred. Please try again.", ephemeral=True)
+            return
+
+        # Properly reset tournament
+        tournament.__init__()
+        tournament.max_players = max_players
+        tournament.channel = self.target_channel
+        tournament.target_channel = self.target_channel
+        tournament.title = self.title_field.value
+        tournament.map = self.map_field.value
+        tournament.abilities = self.abilities_field.value
+        tournament.mode = mode
+        tournament.prize = self.prize_field.value
+        tournament.players = []
+        tournament.teams = {}
+        tournament.team_invites = {}
+        tournament.eliminated = []
+        tournament.active = False
+
+        embed = discord.Embed(title=f"🏆 {tournament.title}", color=0x00ff00)
+        embed.add_field(name="🗺️ Map", value=tournament.map, inline=True)
+        embed.add_field(name="💥 Abilities", value=tournament.abilities, inline=True)
+        embed.add_field(name="🎮 Mode", value=tournament.mode, inline=True)
+        embed.add_field(name="💶 Prize", value=tournament.prize, inline=True)
+        embed.add_field(name="👥 Max Players", value=str(max_players), inline=True)
+
+        # Enhanced Stumble Guys rules with colors
+        rules_text = (
+            "🔴 **NO TEAMING** - Teams are only allowed in designated team modes\n"
+            "🟠 **NO GRIEFING** - Don't intentionally sabotage other players\n"
+            "🟡 **NO EXPLOITING** - Use of glitches or exploits will result in disqualification\n"
+            "🟢 **FAIR PLAY** - Respect all players and play honorably\n"
+            "🔵 **NO RAGE QUITTING** - Leaving mid-match counts as a forfeit\n"
+            "🟣 **FOLLOW HOST** - Listen to tournament host instructions\n"
+            "⚫ **NO TOXICITY** - Keep chat friendly and respectful\n"
+            "⚪ **BE READY** - Join matches promptly when called\n"
+            "🟤 **NO ALTS** - One account per player only"
+        )
+
+        embed.add_field(name="📜 **Stumble Guys Tournament Rules**", value=rules_text, inline=False)
+
+        view = TournamentView()
+        # Update the participant count button to show correct max players
+        for item in view.children:
+            if hasattr(item, 'custom_id') and item.custom_id == "participant_count":
+                if tournament.mode == "2v2":
+                    item.label = f"0 teams/{max_players//2}"
+                else:
+                    item.label = f"0/{max_players}"
+                break
+
+        # Send tournament message
+        tournament.message = await self.target_channel.send(embed=embed, view=view)
+
+        # Respond with success
+        await interaction.response.send_message("✅ Tournament created successfully!", ephemeral=True)
+
+        print(f"✅ Tournament created: {max_players} max players, Map: {tournament.map}")
+
+class TournamentConfigView(discord.ui.View):
+    def __init__(self, target_channel=None):
+        super().__init__(timeout=None)
+        self.target_channel = target_channel
+
+    @discord.ui.button(label="Set Tournament", style=discord.ButtonStyle.primary, custom_id="set_tournament_config")
+    async def set_tournament(self, interaction: discord.Interaction, button: discord.ui.Button):
+        try:
+            # Use the channel where the interaction happened if no target channel is set
+            target_channel = self.target_channel or interaction.channel
+            
+            # Ensure we have a valid channel
+            if not target_channel:
+                return await interaction.response.send_message("❌ Unable to determine target channel. Please try again.", ephemeral=True)
+            
+            modal = TournamentConfigModal(target_channel)
+            await interaction.response.send_modal(modal)
+        except Exception as e:
+            print(f"Error in set_tournament: {e}")
+            try:
+                if not interaction.response.is_done():
+                    await interaction.response.send_message("❌ An error occurred. Please try again.", ephemeral=True)
+                else:
+                    await interaction.followup.send("❌ An error occurred. Please try again.", ephemeral=True)
+            except Exception as follow_error:
+                print(f"Failed to send error message: {follow_error}")
+
+class TournamentView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+        
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        return True
+
+    @discord.ui.button(label="Register", style=discord.ButtonStyle.green, custom_id="tournament_register")
+    async def register_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        try:
+            # Check tournament state
+            if tournament.max_players == 0:
+                return await interaction.response.send_message("❌ No tournament has been created yet.", ephemeral=True)
+            if tournament.active:
+                return await interaction.response.send_message("⚠️ Tournament already started.", ephemeral=True)
+            if interaction.user in tournament.players:
+                return await interaction.response.send_message("❌ You are already registered.", ephemeral=True)
+
+            # For 2v2 mode, check team requirements
+            if tournament.mode == "2v2":
+                if interaction.user.id not in tournament.teams:
+                    return await interaction.response.send_message("❌ You need a teammate to register for 2v2! Use `!invite @user` to invite someone.", ephemeral=True)
+
+                teammate_id = tournament.teams[interaction.user.id]
+                teammate = interaction.guild.get_member(teammate_id)
+
+                if teammate in tournament.players:
+                    return await interaction.response.send_message("❌ Your team is already registered.", ephemeral=True)
+
+                if len(tournament.players) >= tournament.max_players:
+                    return await interaction.response.send_message("❌ Tournament is full.", ephemeral=True)
+
+                # Add both team members
+                tournament.players.extend([interaction.user, teammate])
+
+                # Update participant count for teams
+                for item in self.children:
+                    if hasattr(item, 'custom_id') and item.custom_id == "participant_count":
+                        item.label = f"{len(tournament.players)//2} teams/{tournament.max_players//2}"
+                        break
+
+                await interaction.response.edit_message(view=self)
+                await interaction.followup.send(f"✅ Team {interaction.user.display_name} & {teammate.display_name} registered! ({len(tournament.players)//2}/{tournament.max_players//2} teams)", ephemeral=True)
+
+            else:
+                # 1v1 mode
+                if len(tournament.players) >= tournament.max_players:
+                    return await interaction.response.send_message("❌ Tournament is full.", ephemeral=True)
+
+                tournament.players.append(interaction.user)
+
+                for item in self.children:
+                    if hasattr(item, 'custom_id') and item.custom_id == "participant_count":
+                        item.label = f"{len(tournament.players)}/{tournament.max_players}"
+                        break
+
+                await interaction.response.edit_message(view=self)
+                await interaction.followup.send(f"✅ {interaction.user.display_name} registered! ({len(tournament.players)}/{tournament.max_players})", ephemeral=True)
+
+        except Exception as e:
+            print(f"Error in register_button: {e}")
+            try:
+                if not interaction.response.is_done():
+                    await interaction.response.send_message("❌ An error occurred. Please try again.", ephemeral=True)
+                else:
+                    await interaction.followup.send("❌ An error occurred. Please try again.", ephemeral=True)
+            except Exception as follow_error:
+                print(f"Failed to send error message: {follow_error}")
+
+    @discord.ui.button(label="Unregister", style=discord.ButtonStyle.red, custom_id="tournament_unregister")
+    async def unregister_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        try:
+            if tournament.max_players == 0:
+                return await interaction.response.send_message("❌ No tournament has been created yet.", ephemeral=True)
+            if tournament.active:
+                return await interaction.response.send_message("⚠️ Tournament already started.", ephemeral=True)
+            if interaction.user not in tournament.players:
+                return await interaction.response.send_message("❌ You are not registered.", ephemeral=True)
+
+            if tournament.mode == "2v2":
+                teammate_id = tournament.teams[interaction.user.id]
+                teammate = interaction.guild.get_member(teammate_id)
+
+                # Remove both team members
+                if interaction.user in tournament.players:
+                    tournament.players.remove(interaction.user)
+                if teammate in tournament.players:
+                    tournament.players.remove(teammate)
+
+                for item in self.children:
+                    if hasattr(item, 'custom_id') and item.custom_id == "participant_count":
+                        item.label = f"{len(tournament.players)//2} teams/{tournament.max_players//2}"
+                        break
+
+                await interaction.response.edit_message(view=self)
+                await interaction.followup.send(f"✅ Team {interaction.user.display_name} & {teammate.display_name} unregistered! ({len(tournament.players)//2}/{tournament.max_players//2} teams)", ephemeral=True)
+
+            else:
+                tournament.players.remove(interaction.user)
+
+                for item in self.children:
+                    if hasattr(item, 'custom_id') and item.custom_id == "participant_count":
+                        item.label = f"{len(tournament.players)}/{tournament.max_players}"
+                        break
+
+                await interaction.response.edit_message(view=self)
+                await interaction.followup.send(f"✅ {interaction.user.display_name} unregistered! ({len(tournament.players)}/{tournament.max_players})", ephemeral=True)
+
+        except Exception as e:
+            print(f"Error in unregister_button: {e}")
+            try:
+                if not interaction.response.is_done():
+                    await interaction.response.send_message("❌ An error occurred. Please try again.", ephemeral=True)
+                else:
+                    await interaction.followup.send("❌ An error occurred. Please try again.", ephemeral=True)
+            except Exception as follow_error:
+                print(f"Failed to send error message: {follow_error}")
+discord.ui.button(label="0/0", style=discord.ButtonStyle.secondary, disabled=True, custom_id="participant_count")
+    async def participant_count(self, interaction: discord.Interaction, button: discord.ui.Button):
+        pass
+
+    @discord.ui.button(label="🚀 Start Tournament", style=discord.ButtonStyle.primary, custom_id="start_tournament")
+    async def start_tournament(self, interaction: discord.Interaction, button: discord.ui.Button):
+        try:
+            if not interaction.user.guild_permissions.manage_channels:
+                return await interaction.response.send_message("❌ You need 'Manage Channels' permission to start tournaments.", ephemeral=True)
+
+            if tournament.max_players == 0:
+                return await interaction.response.send_message("❌ No tournament has been created yet.", ephemeral=True)
+
+            if tournament.active:
+                return await interaction.response.send_message("❌ Tournament already started.", ephemeral=True)
+
+            # Allow tournament to start even without max players
+            if len(tournament.players) < 2:
+                return await interaction.response.send_message("❌ Not enough players to start tournament (minimum 2 players).", ephemeral=True)
+
+            await interaction.response.send_message("🚀 Starting tournament...", ephemeral=True)
+
+            # Add bot players if needed for proper bracket
+            while len(tournament.players) % 2 != 0:
+                tournament.players.append(f"Bot{tournament.fake_count}")
+                tournament.fake_count += 1
+              
